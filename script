@@ -1,0 +1,448 @@
+# =====================================================
+# ASO-Propuesta15: Supervisión de la salud del hardware
+# Script avanzado en PowerShell para monitorear en tiempo real:
+#   - Temperatura del CPU
+#   - Uso de RAM
+#   - Estado de los discos
+#
+# Incluye:
+#   - Análisis predictivo
+#   - Generación de reportes (HTML y CSV)
+#   - Notificaciones automatizadas (correo vía Gmail)
+#   - Configuración interactiva de umbrales
+#   - Programación de la ejecución mediante el Programador de Tareas
+# =====================================================
+
+# =====================================================
+# Configuración de rutas y creación de la estructura de carpetas
+# =====================================================
+$global:BaseDir = "$env:USERPROFILE\Documents\proyecto_aso"
+
+function Initialize-FolderStructure {
+    if (-not (Test-Path $BaseDir)) {
+        New-Item -Path $BaseDir -ItemType Directory | Out-Null
+    }
+    # Crear subcarpetas para logs y reportes
+    $global:LogDir = "$BaseDir\Logs"
+    $global:ReportDir = "$BaseDir\Reports"
+    if (-not (Test-Path $LogDir)) { New-Item -Path $LogDir -ItemType Directory | Out-Null }
+    if (-not (Test-Path $ReportDir)) { New-Item -Path $ReportDir -ItemType Directory | Out-Null }
+}
+
+# =====================================================
+# Función para verificar permisos administrativos
+# =====================================================
+function Check-Admin {
+    $currentUser = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+    if (-not $currentUser.IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)) {
+        Write-Host "El script debe ejecutarse con permisos administrativos." -ForegroundColor Red
+        Exit 1
+    }
+}
+
+# =====================================================
+# Función para evitar múltiples instancias del script
+# =====================================================
+function Prevent-MultipleInstances {
+    $scriptName = $MyInvocation.MyCommand.Name
+    $runningInstances = (Get-Process | Where-Object { $_.Path -eq $PSCommandPath }).Count
+    if ($runningInstances -gt 1) {
+        Write-Host "Otra instancia del script ya se está ejecutando. Saliendo..." -ForegroundColor Yellow
+        Exit
+    }
+}
+
+# =====================================================
+# Inicialización del entorno de monitoreo
+# =====================================================
+function Initialize-Monitoring {
+    Write-Host "Inicializando entorno de monitoreo..."
+    Check-Admin
+    Initialize-FolderStructure
+    Write-Host "Entorno inicializado. Directorios creados: Logs y Reports en $BaseDir"
+}
+
+# =====================================================
+# Configuración interactiva de umbrales y parámetros
+# =====================================================
+function Configure-Thresholds {
+    $configFile = "$BaseDir\monitor_config.json"
+    if (Test-Path $configFile) {
+        $modify = Read-Host "Ya existe un archivo de configuración. ¿Desea modificarlo? (S/N)"
+        if ($modify -eq "S") {
+            Write-Host "Ingrese los nuevos parámetros de monitoreo:"
+            $cpuThreshold = Read-Host "Ingrese la temperatura máxima del CPU (°C)"
+            $ramThreshold = Read-Host "Ingrese el porcentaje máximo de uso de RAM (%)"
+            $diskStatus   = "Healthy"
+            $emailNotifications = Read-Host "¿Desea habilitar notificaciones por correo? (S/N)"
+            
+            # Parámetros para Gmail
+            $smtpServer = ""
+            $smtpPort   = 0
+            $smtpUser   = ""
+            $smtpPass   = ""
+            $toEmail    = ""
+            if ($emailNotifications -eq "S") {
+                $smtpServer = "smtp.gmail.com"
+                $smtpPort   = 587
+                $smtpUser   = "monicaortega0023@gmail.com"
+                $smtpPass   = "dhai ynqk nrau izxk"
+                $toEmail    = "monicaortega0023@gmail.com"
+            }
+            $global:Config = @{
+                CPUThreshold       = [int]$cpuThreshold;
+                RAMThreshold       = [int]$ramThreshold;
+                DiskStatus         = $diskStatus;
+                EmailNotifications = ($emailNotifications -eq "S");
+                SMTPServer         = $smtpServer;
+                SMTPPort           = [int]$smtpPort;
+                SMTPUser           = $smtpUser;
+                SMTPPass           = $smtpPass;
+                EmailFrom          = $smtpUser;
+                EmailTo            = $toEmail;
+            }
+            $global:Config | ConvertTo-Json | Out-File $configFile
+            Write-Host "Configuración guardada en $configFile"
+        } else {
+            $global:Config = Get-Content $configFile | ConvertFrom-Json
+            Write-Host "Configuración cargada desde archivo."
+        }
+    } else {
+        Write-Host "No se encontró configuración previa. Ingrese los siguientes parámetros de monitoreo:"
+        $cpuThreshold = Read-Host "Ingrese la temperatura máxima del CPU (°C)"
+        $ramThreshold = Read-Host "Ingrese el porcentaje máximo de uso de RAM (%)"
+        $diskStatus   = "Healthy"
+        $emailNotifications = Read-Host "¿Desea habilitar notificaciones por correo? (S/N)"
+        
+        $smtpServer = ""
+        $smtpPort   = 0
+        $smtpUser   = ""
+        $smtpPass   = ""
+        $toEmail    = ""
+        if ($emailNotifications -eq "S") {
+            $smtpServer = "smtp.gmail.com"
+            $smtpPort   = 587
+            $smtpUser   = "monicaortega0023@gmail.com"
+            $smtpPass   = "dhai ynqk nrau izxk"
+            $toEmail    = "monicaortega0023@gmail.com"
+        }
+        $global:Config = @{
+            CPUThreshold       = [int]$cpuThreshold;
+            RAMThreshold       = [int]$ramThreshold;
+            DiskStatus         = $diskStatus;
+            EmailNotifications = ($emailNotifications -eq "S");
+            SMTPServer         = $smtpServer;
+            SMTPPort           = [int]$smtpPort;
+            SMTPUser           = $smtpUser;
+            SMTPPass           = $smtpPass;
+            EmailFrom          = $smtpUser;
+            EmailTo            = $toEmail;
+        }
+        $global:Config | ConvertTo-Json | Out-File $configFile
+        Write-Host "Configuración guardada en $configFile"
+    }
+}
+
+# =====================================================
+# Función para obtener la temperatura del CPU
+# Se usa búsqueda recursiva en el JSON para encontrar "CPU Package"
+# y se convierte el valor (por ejemplo, "57,5 Â°C") en número.
+# =====================================================
+function Get-CPUTemperature {
+    function Find-Node {
+        param(
+            [Parameter(Mandatory=$true)] $node,
+            [Parameter(Mandatory=$true)] [string]$pattern
+        )
+        if ($node.Text -match $pattern -and $node.Value -and $node.Value -ne "") {
+            return $node
+        }
+        if ($node.Children) {
+            foreach ($child in $node.Children) {
+                $result = Find-Node -node $child -pattern $pattern
+                if ($result) { return $result }
+            }
+        }
+        return $null
+    }
+
+    try {
+        $allData = Invoke-RestMethod -Uri "http://localhost:8085/data.json" -ErrorAction Stop
+        $sensor = Find-Node -node $allData -pattern "CPU Package"
+        if ($sensor) {
+            $tempString = $sensor.Value -replace "[^\d,\.]", ""
+            $tempString = $tempString -replace ",", "."
+            try {
+                $tempValue = [double]$tempString
+                return [math]::Round($tempValue, 2)
+            } catch {
+                Write-Host "Error al convertir el valor '$($sensor.Value)' a número." -ForegroundColor Red
+                return $null
+            }
+        } else {
+            Write-Host "No se encontró sensor de temperatura para el CPU." -ForegroundColor Yellow
+            return $null
+        }
+    } catch {
+        Write-Host "No se pudo obtener la temperatura del CPU desde OpenHardwareMonitor: $_" -ForegroundColor Yellow
+        return $null
+    }
+}
+
+# =====================================================
+# Función para monitorear la temperatura del CPU y generar alertas
+# Registra el valor en el log y envía notificación si supera el umbral.
+# =====================================================
+function Monitor-CPU {
+    Write-Host "Monitoreando temperatura del CPU..."
+    $cpuTemp = Get-CPUTemperature
+    if ($cpuTemp -ne $null) {
+        Write-Host "Temperatura actual del CPU: $cpuTemp °C"
+        $logEntry = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), CPU, $cpuTemp"
+        Add-Content -Path "$LogDir\cpu_log.csv" -Value $logEntry
+        if ($cpuTemp -gt $Config.CPUThreshold) {
+            Write-Host "ALERTA: Temperatura del CPU excede el umbral configurado ($($Config.CPUThreshold) °C)" -ForegroundColor Red
+            Send-Notification -Type "CPU" -Message "Temperatura alta detectada: $cpuTemp °C"
+        }
+    }
+}
+
+# =====================================================
+# Función para monitorear el uso de RAM y detectar fugas
+# Registra el porcentaje de uso y envía alerta si supera el umbral.
+# =====================================================
+function Monitor-RAM {
+    Write-Host "Monitoreando uso de RAM..."
+    $osInfo = Get-CimInstance Win32_OperatingSystem
+    $totalMemory = [math]::Round($osInfo.TotalVisibleMemorySize / 1MB, 2)
+    $freeMemory = [math]::Round($osInfo.FreePhysicalMemory / 1MB, 2)
+    $usedMemoryPercent = [math]::Round((($totalMemory - $freeMemory) / $totalMemory * 100), 2)
+    Write-Host "Uso de RAM: $usedMemoryPercent % (Total: $totalMemory GB, Libre: $freeMemory GB)"
+    $logEntry = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), RAM, $usedMemoryPercent"
+    Add-Content -Path "$LogDir\ram_log.csv" -Value $logEntry
+    if ($usedMemoryPercent -gt $Config.RAMThreshold) {
+        Write-Host "ALERTA: Uso de RAM excede el umbral configurado ($($Config.RAMThreshold) %)" -ForegroundColor Red
+        Send-Notification -Type "RAM" -Message "Uso de RAM alto: $usedMemoryPercent %"
+    }
+    $highMemoryProcs = Get-Process | Where-Object { $_.WorkingSet64 -gt 500MB } | Sort-Object -Descending WorkingSet64
+    if ($highMemoryProcs) {
+        Write-Host "Procesos con alto consumo de memoria:"
+        $highMemoryProcs | Format-Table -AutoSize
+    }
+}
+
+# =====================================================
+# Función para analizar el estado de los discos
+# Registra el estado y envía alerta si hay problemas.
+# =====================================================
+function Analyze-Disks {
+    Write-Host "Analizando estado de los discos..."
+    $physicalDisks = Get-PhysicalDisk
+    foreach ($disk in $physicalDisks) {
+        $health = $disk.HealthStatus
+        Write-Host "Disco: $($disk.FriendlyName) - Estado: $health"
+        $logEntry = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), Disco, $($disk.FriendlyName), $health"
+        Add-Content -Path "$LogDir\disk_log.csv" -Value $logEntry
+        if ($health -ne $Config.DiskStatus) {
+            Write-Host "ALERTA: El disco $($disk.FriendlyName) presenta problemas (Estado: $health)" -ForegroundColor Red
+            Send-Notification -Type "Disco" -Message "Problema detectado en disco $($disk.FriendlyName): Estado $health"
+        }
+    }
+}
+
+# =====================================================
+# Función para analizar tendencias históricas y predecir fallos
+# Compara los últimos 5 registros de temperatura.
+# =====================================================
+function Analyze-Trends {
+    Write-Host "Analizando tendencias históricas..."
+    $cpuLog = "$LogDir\cpu_log.csv"
+    if (Test-Path $cpuLog) {
+        $entries = Get-Content $cpuLog | Select-Object -Last 5
+        if ($entries.Count -ge 5) {
+            $temps = $entries | ForEach-Object { [double]($_.Split(",")[2].Trim()) }
+            if (($temps[-1] - $temps[0]) -gt 5) {
+                Write-Host "ALERTA PREDICTIVA: Se detecta una tendencia de aumento en la temperatura del CPU." -ForegroundColor DarkRed
+                Send-Notification -Type "CPU" -Message "Tendencia ascendente de temperatura: de $($temps[0]) a $($temps[-1]) °C"
+            }
+        }
+    }
+}
+
+# =====================================================
+# Función para generar reportes en HTML y CSV
+# Consolidando logs de CPU, RAM y discos.
+# =====================================================
+function Generate-Report {
+    Write-Host "Generando reportes..."
+    $reportTime = Get-Date -Format "yyyyMMdd_HHmmss"
+    $htmlReport = "$ReportDir\Report_$reportTime.html"
+    $csvReport  = "$ReportDir\Report_$reportTime.csv"
+    
+    $htmlContent = @"
+<html>
+<head>
+<title>Reporte de Monitoreo - $reportTime</title>
+<style>
+    table, th, td { border: 1px solid black; border-collapse: collapse; padding: 5px; }
+</style>
+</head>
+<body>
+<h2>Reporte de Monitoreo</h2>
+<p>Fecha: $(Get-Date)</p>
+
+<h3>Temperatura del CPU</h3>
+<table>
+<tr><th>Fecha/Hora</th><th>Temperatura (°C)</th></tr>
+"@
+    if (Test-Path "$LogDir\cpu_log.csv") {
+        $cpuData = Get-Content "$LogDir\cpu_log.csv" | ForEach-Object {
+            $parts = $_.Split(",")
+            "<tr><td>$($parts[0])</td><td>$($parts[2])</td></tr>"
+        }
+        $htmlContent += $cpuData -join "`n"
+    }
+    $htmlContent += @"
+</table>
+
+<h3>Uso de RAM</h3>
+<table>
+<tr><th>Fecha/Hora</th><th>Uso (%)</th></tr>
+"@
+    if (Test-Path "$LogDir\ram_log.csv") {
+        $ramData = Get-Content "$LogDir\ram_log.csv" | ForEach-Object {
+            $parts = $_.Split(",")
+            "<tr><td>$($parts[0])</td><td>$($parts[2])</td></tr>"
+        }
+        $htmlContent += $ramData -join "`n"
+    }
+    $htmlContent += @"
+</table>
+
+<h3>Estado de Discos</h3>
+<table>
+<tr><th>Fecha/Hora</th><th>Disco</th><th>Estado</th></tr>
+"@
+    if (Test-Path "$LogDir\disk_log.csv") {
+        $diskData = Get-Content "$LogDir\disk_log.csv" | ForEach-Object {
+            $parts = $_.Split(",")
+            "<tr><td>$($parts[0])</td><td>$($parts[2])</td><td>$($parts[3])</td></tr>"
+        }
+        $htmlContent += $diskData -join "`n"
+    }
+    $htmlContent += @"
+</table>
+</body>
+</html>
+"@
+    $htmlContent | Out-File $htmlReport -Encoding utf8
+    Write-Host "Reporte HTML generado: $htmlReport"
+    
+    $csvContent = "FechaHora,Tipo,Valor1,Valor2`n"
+    if (Test-Path "$LogDir\cpu_log.csv") { $csvContent += (Get-Content "$LogDir\cpu_log.csv") + "`n" }
+    if (Test-Path "$LogDir\ram_log.csv") { $csvContent += (Get-Content "$LogDir\ram_log.csv") + "`n" }
+    if (Test-Path "$LogDir\disk_log.csv") { $csvContent += (Get-Content "$LogDir\disk_log.csv") + "`n" }
+    $csvContent | Out-File $csvReport -Encoding utf8
+    Write-Host "Reporte CSV generado: $csvReport"
+}
+
+# =====================================================
+# Función para enviar notificaciones vía correo (Gmail)
+# =====================================================
+function Send-Notification {
+    param (
+        [string]$Type,
+        [string]$Message
+    )
+    Write-Host "Enviando notificación para ${Type}: ${Message}"
+    if ($Config.EmailNotifications) {
+        try {
+            $smtpServer = "smtp.gmail.com"
+            $smtpPort   = 587
+            $smtpUser   = $Config.SMTPUser
+            $smtpPass   = $Config.SMTPPass
+            $toEmail    = $Config.EmailTo
+            
+            $credential = New-Object System.Management.Automation.PSCredential (
+                $smtpUser, 
+                (ConvertTo-SecureString $smtpPass -AsPlainText -Force)
+            )
+            
+            $subject = "Alerta de Monitoreo: ${Type}"
+            $body = "Se ha detectado un problema en ${Type}:`n${Message}`nFecha: $(Get-Date)"
+            
+            Send-MailMessage -SmtpServer $smtpServer -Port $smtpPort -Credential $credential `
+                             -From $smtpUser -To $toEmail -Subject $subject -Body $body -UseSsl
+            Write-Host "Notificación por correo enviada."
+        } catch {
+            Write-Host "Error al enviar notificación por correo: $_" -ForegroundColor Red
+        }
+    }
+}
+
+# =====================================================
+# Función para programar la ejecución del script (Tareas de Windows)
+# =====================================================
+function Schedule-Task {
+    Write-Host "Programando tarea en el Programador de Tareas de Windows..."
+    $taskName = "MonitoreoHardwareScript"
+    $existingTask = schtasks /Query /TN $taskName 2>$null
+    if ($existingTask) {
+        Write-Host "La tarea '$taskName' ya está programada."
+    } else {
+        $action = "powershell.exe -ExecutionPolicy Bypass -File `"$PSCommandPath`""
+        schtasks /Create /SC MINUTE /MO 5 /TN $taskName /TR $action /RL HIGHEST
+        Write-Host "Tarea '$taskName' programada para ejecutarse cada 5 minutos."
+    }
+}
+
+# =====================================================
+# Función para exportar la tarea programada a un archivo XML
+# =====================================================
+function Export-ScheduledTaskXml {
+    $taskName = "MonitoreoHardwareScript"
+    $exportFile = "$BaseDir\MonitoreoHardwareScript.xml"
+    try {
+        schtasks /Query /TN $taskName /XML > $exportFile
+        Write-Host "La tarea '$taskName' ha sido exportada a XML en: $exportFile"
+    } catch {
+        Write-Host "Error al exportar la tarea a XML: $_" -ForegroundColor Red
+    }
+}
+
+# =====================================================
+# Función para restaurar servicios y ejecutar diagnósticos adicionales
+# =====================================================
+function Restore-Diagnostics {
+    Write-Host "Ejecutando rutina de restauración y diagnóstico..."
+    # Ejemplo: Reiniciar el servicio de impresión (Spooler)
+    $service = Get-Service -Name "Spooler" -ErrorAction SilentlyContinue
+    if ($service -and $service.Status -ne "Running") {
+        Restart-Service -Name "Spooler"
+        Write-Host "Servicio 'Spooler' reiniciado."
+    } else {
+        Write-Host "El servicio 'Spooler' ya está en ejecución o no se encontró."
+    }
+}
+
+# =====================================================
+# Función principal que coordina la ejecución de todas las tareas
+# =====================================================
+function Main {
+    Prevent-MultipleInstances
+    Initialize-Monitoring
+    Configure-Thresholds
+    Monitor-CPU
+    Monitor-RAM
+    Analyze-Disks
+    Analyze-Trends
+    Generate-Report
+    Restore-Diagnostics
+    Schedule-Task
+    Export-ScheduledTaskXml
+}
+
+# =====================================================
+# Inicio del script
+# =====================================================
+Main
